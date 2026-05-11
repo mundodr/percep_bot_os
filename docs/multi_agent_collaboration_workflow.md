@@ -87,6 +87,122 @@ Plan -> Branch -> Implement -> Verify -> PR -> CI + Codex Review -> Merge -> Int
 
 Codex 关注**单 PR 级别**的代码质量；Kimi 关注**Phase 级别**的系统行为。
 
+### 2.4 自治管线架构
+
+在 §2.1 的手动编排基础上，引入 **supervisor 守护进程 + cursor-agent worktree worker** 自治管线模式，实现任务的全自动分解、调度、执行、合并和进度汇报。
+
+**端到端流程**：
+
+```text
+用户需求
+  ↓
+/agent-worktree <requirement>  (Cursor slash command)
+  ↓
+解析需求 → pipeline/state/config.json
+  ↓
+LLM 任务分解 → pipeline/state/queue.json  (⌈target × 1.3⌉ 个任务)
+  ↓
+pipeline-start 启动 supervisor 守护进程
+  ↓
+supervisor 60s tick 循环:
+  stage 1: 健康检查（heartbeat 超 300s → SIGKILL + 重排队）
+  stage 2: 调度（从 queue 取任务 → 文件冲突检测 → 角色匹配 → 启动 worker）
+  stage 3: 轮询结果（解析 PIPELINE_RESULT → 成功进 in_pr / 失败重试或放弃）
+  stage 3b: 轮询 PR（merged → completed / behind → update-branch）
+  stage 4: 队列补充（open < 5 时 LLM 自动生成新任务）
+  stage 5: 快照（写 status.json）
+  stage 6: 进度报告（每 20min LLM 生成，写入 plan-ledger.md）
+  stop check → 满足停止条件时优雅退出
+```
+
+**架构总览**：
+
+```text
+┌──────────────────────────────────────────────────────────┐
+│  _supervisor.sh (nohup setsid, 后台常驻)                  │
+│                                                          │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐                  │
+│  │ slot-nav │  │ slot-sim │  │ slot-brain│  ...           │
+│  │ worktree │  │ worktree │  │ worktree │                │
+│  │ cursor-  │  │ cursor-  │  │ cursor-  │                │
+│  │ agent    │  │ agent    │  │ agent    │                │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                │
+│       │              │              │                      │
+│       ↓              ↓              ↓                      │
+│  git push → PR  git push → PR  git push → PR             │
+│       ↓              ↓              ↓                      │
+│  auto-merge     auto-merge     auto-merge                │
+└──────────────────────────────────────────────────────────┘
+```
+
+**状态目录结构**：
+
+```text
+pipeline/state/
+├── config.json          # 管线配置（目标、worker 数、停止条件等）
+├── queue.json           # 待执行任务队列（QUEUED 状态）
+├── plan-ledger.md       # 计划账本（LLM 共享记忆，事件日志）
+├── status.json          # 当前状态快照（每 tick 更新）
+├── status.html          # 浏览器仪表盘（静态 HTML，自动刷新）
+├── orchestrator.pid     # supervisor 守护进程 PID
+├── progress-latest.txt  # 最新进度报告（纯文本）
+├── inflight/            # 正在执行的任务（每 slot 一个 JSON）
+├── in_pr/               # 已创建 PR 等待合并
+├── completed/           # 已合并完成
+└── failures/            # 失败任务（含失败原因）
+```
+
+**supervisor 守护进程特性**：
+
+- 通过 `nohup setsid` 启动，脱离终端，用户可关闭 Cursor 离开
+- 60 秒 tick 循环，每 tick 执行 6 个 stage
+- PID 写入 `orchestrator.pid`，支持优雅停止（`SIGTERM`）和强制停止（`SIGKILL`）
+- 自身脚本更新时通过 `exec` 自我重启，inflight worker 不受影响
+- 所有状态持久化到磁盘，重启后可恢复
+
+### 2.5 Worker 隔离与 Worktree
+
+每个 Worker 通过 `cursor-agent --worktree <slot>` 在独立 git worktree 中工作，实现完全隔离：
+
+**Worktree 布局**：
+
+```text
+~/.cursor/worktrees/percep_bot_os/
+├── slot-navigation/     # Navigation worker 专用 worktree
+├── slot-simulation/     # Simulation worker 专用 worktree
+├── slot-brain/          # Brain worker 专用 worktree
+└── ...                  # 可动态扩展
+```
+
+**隔离保障**：
+
+| 维度 | 隔离方式 |
+| --- | --- |
+| 文件系统 | 每个 slot 独立 worktree 目录，互不影响 |
+| Git 分支 | 每个 worker 创建独立 feature branch |
+| 进程空间 | 每个 worker 独立 cursor-agent 进程 |
+| 上下文 | 每个 worker 只接收自己任务的最小上下文 |
+| 主工作目录 | 始终保持在 main，不受 worker 影响 |
+
+**文件冲突检测**：
+
+supervisor 在调度阶段（stage 2）执行文件冲突检测：
+
+```text
+1. 读取所有 inflight/<slot>.json 中的 files 列表
+2. 将待调度任务的 files 与 inflight 任务的 files 做交集
+3. 若存在重叠文件 → 该任务推迟调度，等待冲突任务完成
+4. 无重叠 → 角色匹配 → 分配到对应 slot → 启动 worker
+```
+
+**角色匹配规则**：
+
+```text
+task.role == slot.role → 优先分配
+task.role == null     → 分配到任意空闲 slot
+无匹配 slot 空闲      → 任务留在队列等待
+```
+
 ## 3. Agent 角色划分
 
 ### 3.1 Main Orchestrator Agent
@@ -502,45 +618,49 @@ Kimi 输出格式：
 
 ## 4. Ship 流水线（每个 PR 必须遵循）
 
-### 4.1 统一开发流程（11 步）
+### 4.1 Worker 自动执行流程
 
-每个 Agent 提交代码变更时，严格走以下流程：
+在自治管线模式下，每个任务由一个 worker 自动完成全部流程（从创建分支到 PR 合并），无需人工介入：
 
 ```text
-Step 1:  从 main 新建 feature branch
-         命名: <type>/<scope>-<brief>
-         示例: feat/nav-edge-follow, fix/obstacle-inflation, test/l1-sim
+Worker 自动执行流程（每个任务一个 worker，一次性完成）:
 
-Step 2:  实现代码 + 本地单元测试
-
-Step 3:  执行 bash scripts/verify.sh
-         必须 ALL OK 才能继续
-
-Step 4:  git add 必要文件（排除 secret / log / __pycache__）
-
-Step 5:  git commit
-         格式: <type>(<scope>): <description>
-         示例: feat(nav): implement edge follow controller
-
-Step 6:  git push -u origin <branch>
-
-Step 7:  通过 REST API 创建 PR
-         （避免 GraphQL 索引延迟导致 "No commits between..." 错误）
-
-Step 8:  等待 CI 跑完
-         - 若失败：本地修复 → 再 push → CI 重跑
-         - 若成功：继续
-
-Step 9:  等待 Codex Cloud review + 👍 reaction
-         auto-merge.yml 自动轮询（30s 间隔，最多 30 min）
-         - Codex 给 👍：auto-merge.yml 自动执行 gh pr merge --auto --squash --delete-branch
-         - Codex 给 COMMENTED review 有 P0：必须修复 → 新 commit → push → 等重审
-         - 超时无反应：手动触发 workflow_dispatch 重试，或检查 Codex 配置
-
-Step 10: PR merged（CI 绿 + Codex 👍 + branch up to date 三重条件满足后自动合并）
-
-Step 11: 确认 main 更新 → 汇报完成
+Step 1:  启动 heartbeat 后台进程（每 30s touch heartbeat 文件）
+Step 2:  同步 worktree: git fetch && git checkout main && git pull --ff-only
+Step 3:  读取任务 JSON（从 inflight/<slot>.json）
+Step 4:  创建 feature branch: git checkout -b <type>/<task-id>
+Step 5:  实现代码（只编辑 task.files 列表中的文件）
+Step 6:  运行 verify.sh（失败则修复重试，不可绕过）
+Step 7:  git commit（使用 git -c user.name/email，不改 ~/.gitconfig）
+Step 8:  git push -u origin <branch>
+Step 9:  REST API 创建 PR（sleep 8s 等 GitHub 索引）
+Step 10: GraphQL 启用 auto-merge squash
+Step 11: 输出 PIPELINE_RESULT JSON，退出
 ```
+
+**分支命名规范**：
+
+```text
+<type>/<task-id>
+示例: feat/nav-001, fix/sim-003, test/brain-002, refactor/map-005
+```
+
+**commit 消息规范**：
+
+```text
+格式: <type>(<scope>): <description>
+示例: feat(nav): implement edge follow controller
+使用 git -c user.name="pipeline-bot" -c user.email="bot@pipeline" commit
+```
+
+**关键约束**：
+
+- Worker 只能编辑 `task.files` 列表中的文件，不得跨越 ownership 边界
+- verify.sh 必须通过才能 push，失败时 worker 自动修复重试
+- PR 通过 REST API 创建（避免 GraphQL 索引延迟导致 "No commits between..." 错误）
+- 创建 PR 后 sleep 8s 等待 GitHub 索引，再启用 auto-merge
+
+> **向后兼容**：在非管线模式下（手动编排），Agent 仍可按原有 11 步流程操作：从 main 新建分支 → 实现 → verify.sh → git push → REST API 创建 PR → 等 CI + Codex → merge → 汇报。管线模式将这些步骤自动化。
 
 ### 4.2 verify.sh — 唯一验证真相源
 
@@ -687,6 +807,117 @@ jobs:
 | 8 | auto-merge.yml 同一 PR 多次触发 | 正常行为（concurrency group 保证只有一个实例在跑） |
 | 9 | Codex 给了 COMMENTED review 但没给 👍 | 说明有 P0/P1 问题，必须修复后等 Codex 重审并给 👍 |
 
+### 4.6 Worker 输出协议
+
+Worker 在退出前**必须**输出 `PIPELINE_RESULT` JSON，supervisor 通过解析此输出判定任务结果：
+
+**成功**：
+
+```json
+PIPELINE_RESULT={"status":"ok","pr":"https://github.com/owner/repo/pull/42","pr_number":42,"commit":"abc1234","slot":"slot-navigation"}
+```
+
+**失败**：
+
+```json
+PIPELINE_RESULT={"status":"err","reason":"verify.sh failed after 3 retries","detail":"ruff check found 12 errors in navigation_core/reactive_navigator.py","slot":"slot-navigation"}
+```
+
+**字段说明**：
+
+| 字段 | 类型 | 必须 | 说明 |
+| --- | --- | --- | --- |
+| `status` | `"ok" \| "err"` | 是 | 任务最终状态 |
+| `pr` | string | ok 时必须 | PR 完整 URL |
+| `pr_number` | number | ok 时必须 | PR 编号 |
+| `commit` | string | ok 时必须 | 最终 commit SHA |
+| `slot` | string | 是 | worker slot 名称 |
+| `reason` | string | err 时必须 | 简短失败原因（<= 120 字符） |
+| `detail` | string | err 时可选 | 详细失败信息 |
+
+**supervisor 处理逻辑**：
+
+```text
+解析 worker 输出 → 找到 PIPELINE_RESULT= 行
+  ├─ status == "ok"  → 任务移入 in_pr/<task-id>.json，记录 PR 号
+  ├─ status == "err" → retry++ < 3 ? 重排队到 queue.json : 移入 failures/<task-id>.json
+  └─ 无输出（worker 崩溃/超时）→ 同 err 处理
+```
+
+### 4.7 任务队列 JSON Schema
+
+每个任务记录的 JSON Schema：
+
+```json
+{
+  "id": "string, kebab-case, e.g. nav-001",
+  "type": "test | docs | refactor | feat | fix | chore",
+  "title": "<= 80 chars",
+  "files": ["array of relative paths"],
+  "role": "navigation | simulation | brain | integration | testing | null",
+  "needs_hw_regression": false,
+  "prompt_hint": "1-3 sentences describing what to implement"
+}
+```
+
+**字段说明**：
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 全局唯一标识，kebab-case，如 `nav-001`, `sim-012` |
+| `type` | 任务类型：test / docs / refactor / feat / fix / chore |
+| `title` | 任务标题，<= 80 字符 |
+| `files` | 该任务涉及的文件路径列表（用于冲突检测和 ownership 约束） |
+| `role` | 期望执行此任务的 worker 角色（null 表示任意 worker） |
+| `needs_hw_regression` | 是否需要硬件回归测试 |
+| `prompt_hint` | 给 worker LLM 的提示，1-3 句话描述实现要点 |
+
+**任务类型分布目标**：
+
+```text
+test      30%   — 单元测试、集成测试、仿真场景
+feat      25%   — 新功能实现
+refactor  15%   — 代码重构、模块解耦
+docs      15%   — 文档、注释、设计说明
+chore     10%   — 配置、CI、依赖管理
+fix        5%   — Bug 修复
+```
+
+**LLM 任务分解规则**：
+
+```text
+1. 初始分解数量 = ⌈target_commits × 1.3⌉（多生成 30% 作为缓冲）
+2. 每个任务应当可由单个 worker 在 1 次 PR 内完成
+3. 任务粒度：一个任务 = 一件事 = 一个 PR
+4. files 列表不得跨越 ownership 边界
+5. 优先生成 test 类型任务（先有测试，再有实现）
+```
+
+**queue.json 示例**：
+
+```json
+[
+  {
+    "id": "nav-001",
+    "type": "test",
+    "title": "add unit tests for ReactiveNavigator edge follow",
+    "files": ["tests/unit/test_edge_follow.py", "tests/conftest.py"],
+    "role": "navigation",
+    "needs_hw_regression": false,
+    "prompt_hint": "Write pytest tests for edge follow controller: direction selection, PD control, exit conditions."
+  },
+  {
+    "id": "sim-001",
+    "type": "feat",
+    "title": "implement 2D obstacle world with configurable layouts",
+    "files": ["sim/sim2d_world.py", "sim/obstacle_layout.py"],
+    "role": "simulation",
+    "needs_hw_regression": false,
+    "prompt_hint": "Create Sim2DWorld class with configurable obstacle layouts, robot spawn, and goal positions."
+  }
+]
+```
+
 ## 5. 上下文隔离策略
 
 ### 5.1 每个 Agent 只拿最小上下文
@@ -765,42 +996,82 @@ handoff/<agent_name>_<task_id>.md
 
 ## 6. 长程任务状态机
 
-每个任务都有状态：
+### 6.1 手动编排模式状态
+
+在手动编排模式下，每个任务按以下状态流转：
 
 ```text
-BACKLOG
-READY
-ASSIGNED
-IN_PROGRESS
-BLOCKED
-IMPLEMENTED
-INTEGRATING
-TESTING
-KIMI_REVIEW
-FAILED_REVIEW
-REVISING
-ACCEPTED
-DONE
+BACKLOG → READY → ASSIGNED → IN_PROGRESS → IMPLEMENTED → TESTING → KIMI_REVIEW
+  ↓                                                                       ↓
+  ...                                                              PASS → ACCEPTED → DONE
+                                                                     ↓
+                                                              FAIL → FAILED_REVIEW → REVISING → TESTING
 ```
 
-状态流转：
+### 6.2 自治管线模式状态
+
+在 supervisor 管线模式下，任务状态简化为 5 个核心状态：
 
 ```text
-READY
-  ↓
-ASSIGNED
-  ↓
-IN_PROGRESS
-  ↓
-IMPLEMENTED
-  ↓
-TESTING
-  ↓
-KIMI_REVIEW
-  ↓
-PASS -> ACCEPTED -> DONE
-  ↓
-FAIL -> FAILED_REVIEW -> REVISING -> TESTING
+QUEUED → INFLIGHT → IN_PR → COMPLETED
+                  ↘ RETRY (最多 3 次) → FAILED
+```
+
+**状态转换详细说明**：
+
+| 状态 | 含义 | 持久化位置 | 转换条件 |
+| --- | --- | --- | --- |
+| QUEUED | 等待调度 | `queue.json` | LLM 分解生成 / 失败重排队 |
+| INFLIGHT | worker 正在执行 | `inflight/<slot>.json` | supervisor 分配给空闲 slot |
+| IN_PR | PR 已创建，等待 CI + Codex + 合并 | `in_pr/<task-id>.json` | worker 输出 `PIPELINE_RESULT.status == "ok"` |
+| COMPLETED | PR 已合并 | `completed/<task-id>.json` | GitHub API 确认 PR merged |
+| RETRY | 执行失败，等待重试 | 回到 `queue.json`（retry++ ） | worker 输出 `err` 且 retry < 3 |
+| FAILED | 重试耗尽，放弃 | `failures/<task-id>.json` | retry >= 3 |
+
+**状态持久化到磁盘**：
+
+```text
+pipeline/state/
+├── queue.json              # QUEUED 任务列表
+├── inflight/
+│   ├── slot-navigation.json  # 该 slot 当前执行的任务
+│   ├── slot-simulation.json
+│   └── slot-brain.json
+├── in_pr/
+│   ├── nav-001.json          # 含 PR 号、PR URL、创建时间
+│   └── sim-002.json
+├── completed/
+│   ├── nav-001.json          # 含合并时间、commit SHA
+│   └── ...
+└── failures/
+    ├── brain-003.json        # 含失败原因、重试次数、每次失败详情
+    └── ...
+```
+
+**inflight JSON 示例**：
+
+```json
+{
+  "task": { "id": "nav-001", "type": "test", "title": "...", "files": [...] },
+  "slot": "slot-navigation",
+  "started_at": "2026-05-11T10:30:00Z",
+  "retry_count": 0,
+  "heartbeat_file": "pipeline/state/inflight/slot-navigation.heartbeat",
+  "worker_pid": 12345
+}
+```
+
+**in_pr JSON 示例**：
+
+```json
+{
+  "task_id": "nav-001",
+  "pr_number": 42,
+  "pr_url": "https://github.com/owner/repo/pull/42",
+  "commit": "abc1234",
+  "created_at": "2026-05-11T10:45:00Z",
+  "branch": "test/nav-001"
+}
 ```
 
 ## 7. 任务分解模板
@@ -1007,7 +1278,7 @@ open_issues
 handoff_notes
 ```
 
-不得只输出“已完成”。
+不得只输出"已完成"。
 
 ## 10. Agent 间通信协议
 
@@ -1072,95 +1343,63 @@ pytest tests/exploration/test_snapshot_recovery.py
 
 ## 11. 进度汇报与审核记录
 
-### 11.1 每 5 分钟进度汇报
+### 11.1 自动化进度汇报（管线模式）
 
-所有 Agent（含 Main Orchestrator）在执行任务期间，**每 5 分钟写一次进度快照**到 `logs/progress/` 目录：
+在自治管线模式下，进度汇报由 supervisor 自动驱动，无需 Agent 手动写进度文件：
 
-文件命名：
-
-```text
-logs/progress/<date>_<time>_<agent_name>.md
-示例: logs/progress/20260511_1735_navigation_core.md
-```
-
-进度文件内容模板：
-
-```markdown
-# 进度汇报
-
-- 时间: 2026-05-11 17:35:00
-- Agent: Navigation Core Agent
-- 任务: NAV-L1-EDGE-FOLLOW-001
-- 状态: IN_PROGRESS
-
-## 当前进展
-
-- [x] 边缘跟随方向选择逻辑
-- [x] 距离误差 PD 控制
-- [ ] 退出条件判断（进行中）
-- [ ] 失败检测
-
-## 本轮完成项
-
-- 实现了 compute_edge_follow_command()
-- 通过了 test_bypass_side_selection 3 个用例
-
-## 阻塞 / 风险
-
-- 无
-
-## 下一步（未来 5 分钟）
-
-- 实现 edge follow 退出条件
-- 编写 test_edge_exit 用例
-
-## 文件变更
-
-- navigation_core/reactive_navigator.py (modified)
-- tests/unit/test_edge_follow.py (new)
-```
-
-规则：
+**汇报机制**：
 
 ```text
-1. 每 5 分钟必须写一次，即使进展为零也要汇报（写"无进展，原因：xxx"）
-2. 文件追加写入 logs/progress/，不删除历史记录
-3. Main Agent 每 5 分钟汇总所有子 Agent 最新进度，输出一份汇总
-4. 用户可随时 ls logs/progress/ 查看各 Agent 当前状态
-5. 连续 3 次"无进展"触发 Main Agent 介入检查是否卡住
+supervisor stage 6（每 20 分钟触发一次）:
+  1. 收集当前所有 slot 状态、queue 深度、PR 状态、failures 数量
+  2. 调用 LLM 生成结构化进度报告
+  3. 写入 pipeline/state/plan-ledger.md（追加到 Progress Reports 节）
+  4. 写入 pipeline/state/progress-latest.txt（覆盖，最新快照）
 ```
 
-汇总文件（Main Agent 写）：
+**自动触发条件**：
+
+| 事件 | 动作 |
+| --- | --- |
+| 每 20 分钟 tick | 生成定期进度报告 |
+| 任务状态转换 | 追加事件到 plan-ledger.md 的 Status Transitions 节 |
+| worker 失败/重试 | 追加失败记录到 plan-ledger.md 的 Failures Reflection 节 |
+| 管线启动/停止 | 记录里程碑事件 |
+
+**用户查看方式**：
 
 ```text
-logs/progress/<date>_<time>_summary.md
+/agent-worktree status     → 输出 status.json 的人类可读摘要
+/agent-worktree progress   → 触发即时进度报告（不等 20 分钟周期）
+浏览器打开 pipeline/state/status.html  → 实时仪表盘（自动刷新）
+cat pipeline/state/progress-latest.txt → 最新进度快照
 ```
 
-汇总模板：
+**progress-latest.txt 模板**：
 
-```markdown
-# 全局进度汇总
+```text
+=== Pipeline Progress ===
+Time: 2026-05-11T17:40:00+08:00
+Uptime: 3h 20m
+Goal: 实现 L0/L1 仿真导航
 
-- 时间: 2026-05-11 17:35:00
-- Phase: 1 (L0/L1 仿真)
+Queue:    12 tasks
+Inflight:  3 tasks (slot-nav: nav-007, slot-sim: sim-004, slot-brain: brain-002)
+In PR:     2 tasks (nav-005 #42, sim-003 #41)
+Completed: 8 tasks
+Failed:    1 task  (brain-001: verify.sh timeout)
 
-| Agent | 任务 | 状态 | 最近更新 | 阻塞 |
-| --- | --- | --- | --- | --- |
-| Navigation Core | NAV-L1-001 | IN_PROGRESS | 17:35 | 无 |
-| Simulation | SIM-L1-001 | IN_PROGRESS | 17:30 | 等 nav 接口 |
-| Test Runner | TEST-L1-001 | READY | — | 等实现完成 |
+Commits merged: 8 / 100 target
+Estimated:      ~18h remaining
 
-## PR 状态
-
-| PR | 分支 | CI | Codex | 合并 |
-| --- | --- | --- | --- | --- |
-| #3 | feat/nav-edge-follow | ✅ pass | 👍 | ✅ merged |
-| #4 | feat/sim-world | 🔄 running | ⏳ | ⏳ pending |
-
-## 风险项
-
-- Simulation Agent 等待 navigation_core 接口稳定
+Recent:
+  [17:38] nav-006 COMPLETED (PR #40 merged)
+  [17:35] brain-002 INFLIGHT (slot-brain)
+  [17:30] sim-004 INFLIGHT (slot-sim)
+  [17:25] nav-007 INFLIGHT (slot-nav)
 ```
+
+> **向后兼容**：在手动编排模式下，Agent 仍按原有规则每 5 分钟写进度快照到 `logs/progress/`。管线模式不再依赖此机制。
 
 ### 11.2 Kimi 审核记录
 
@@ -1232,25 +1471,107 @@ logs/kimi_reviews/<task_id>_<date>_<sequence>.md
 5. 复审时 Kimi 可以引用上一轮记录的编号（如 "KIMI-BLOCK-1 已修复"）
 ```
 
-### 11.3 日志目录结构
+### 11.3 Plan Ledger（计划账本）
+
+`pipeline/state/plan-ledger.md` 是 LLM helper 的**共享记忆**，所有 worker 和 supervisor 共同维护，结构如下：
+
+```markdown
+# Plan Ledger
+
+## Goal
+
+<!-- 管线启动时写入，不可修改 -->
+实现 L0/L1 仿真导航系统，target_commits=100
+
+## Initial Decomposition
+
+<!-- LLM 初始分解快照，记录原始任务列表 -->
+- nav-001: add unit tests for ReactiveNavigator edge follow (test)
+- nav-002: implement edge follow controller (feat)
+- sim-001: implement 2D obstacle world (feat)
+- ...
+Total: 130 tasks (target 100 × 1.3)
+
+## Status Transitions
+
+<!-- 按时间顺序自动追加，每次状态转换一行 -->
+[2026-05-11T10:00:00Z] PIPELINE STARTED (3 workers, target=100)
+[2026-05-11T10:01:00Z] nav-001 QUEUED → INFLIGHT (slot-navigation)
+[2026-05-11T10:15:00Z] nav-001 INFLIGHT → IN_PR (PR #42)
+[2026-05-11T10:20:00Z] nav-001 IN_PR → COMPLETED (merged)
+[2026-05-11T10:25:00Z] brain-001 INFLIGHT → RETRY (verify.sh failed, retry=1)
+...
+
+## Decision Log
+
+<!-- 关键决策记录：接口变更、策略调整、手动干预 -->
+[2026-05-11T12:00:00Z] 用户通过 /agent-worktree scale 5 扩容到 5 workers
+[2026-05-11T14:30:00Z] LLM 自动补充 15 个新任务（queue 低于 5）
+...
+
+## Failures Reflection
+
+<!-- 失败任务详细记录，供 LLM 学习避免同类错误 -->
+| task_id | retries | final_reason | lesson |
+| --- | --- | --- | --- |
+| brain-001 | 3 | verify.sh timeout (mypy hang) | 需要在 brain/ 添加 py.typed marker |
+
+## Progress Reports
+
+<!-- supervisor stage 6 每 20 分钟自动追加 -->
+### Report @ 2026-05-11T10:20:00Z
+- Completed: 5/100, Queue: 120, Inflight: 3, Failed: 0
+- Pace: 5 commits/hour, ETA: ~19h
+- No blockers.
+
+### Report @ 2026-05-11T10:40:00Z
+- Completed: 9/100, Queue: 116, Inflight: 3, Failed: 1
+- Pace: 4.5 commits/hour, ETA: ~20h
+- brain-001 failed 3 times, moved to failures.
+```
+
+**维护规则**：
+
+```text
+1. Goal 节在管线启动时写入，之后不可修改
+2. Status Transitions 只追加不删除，是不可变事件日志
+3. Decision Log 记录所有人工干预和自动决策
+4. Failures Reflection 供 LLM 在生成新任务时参考，避免重蹈覆辙
+5. Progress Reports 由 supervisor stage 6 自动生成
+6. 所有时间戳使用 ISO 8601 格式
+```
+
+### 11.4 日志目录结构
 
 ```text
 logs/
-├── progress/                          # 每 5 分钟进度快照
+├── progress/                          # 手动编排模式：每 5 分钟进度快照
 │   ├── 20260511_1730_navigation_core.md
 │   ├── 20260511_1730_simulation.md
 │   ├── 20260511_1730_summary.md
-│   ├── 20260511_1735_navigation_core.md
 │   └── ...
 ├── kimi_reviews/                      # Kimi 审核记录（不可变）
 │   ├── NAV-L1-001_20260511_01.md
 │   ├── NAV-L1-001_20260511_02.md
 │   └── ...
-└── test_runs/                         # 测试运行证据包（已有）
+└── test_runs/                         # 测试运行证据包
     └── <run_id>/
         ├── summary.json
         ├── assertions.json
         └── ...
+
+pipeline/state/                        # 自治管线模式：自动化状态管理
+├── config.json
+├── queue.json
+├── plan-ledger.md
+├── status.json
+├── status.html
+├── progress-latest.txt
+├── orchestrator.pid
+├── inflight/
+├── in_pr/
+├── completed/
+└── failures/
 ```
 
 ## 12. 长程任务执行节奏
@@ -1355,9 +1676,32 @@ logs/progress/<date>_<time>_user_decision.md
 - 用户不在线时，Agent 按既定计划推进；用户回来时，先看 logs/progress/ 最新汇总再继续。
 ```
 
-### 12.2 不打断用户原则
+### 12.2 不打断用户原则（后台自治）
 
-**Agent 执行期间禁止反向询问用户。** 遇到问题自行决策并记录：
+在自治管线模式下，**用户启动管线后可以关掉 Cursor 去做别的事**，supervisor 在后台持续运行。
+
+**后台运行保障**：
+
+```text
+1. supervisor 通过 nohup setsid 启动，脱离终端和会话
+2. 所有状态持久化到 pipeline/state/，进程重启后可恢复
+3. worker 崩溃由 supervisor 自动重试，无需人工介入
+4. PR behind main 由 supervisor 自动 update-branch
+5. 队列耗尽由 LLM 自动补充新任务
+```
+
+**用户交互方式**（无需打开 Cursor IDE）：
+
+| 命令 | 功能 |
+| --- | --- |
+| `/agent-worktree status` | 查看当前管线状态（queue/inflight/completed/failed 计数） |
+| `/agent-worktree progress` | 触发即时进度报告（不等 20 分钟周期） |
+| `/agent-worktree scale N` | 动态调整 worker 数量（扩容或缩容） |
+| `/agent-worktree stop` | 优雅停止（等待 inflight worker 完成后退出） |
+| `/agent-worktree resume` | 恢复已停止的管线 |
+| 浏览器打开 `pipeline/state/status.html` | 实时仪表盘（静态 HTML，自动刷新） |
+
+**Agent 自主决策规则（不问用户）**：
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
@@ -1370,7 +1714,7 @@ logs/progress/<date>_<time>_user_decision.md
 │  正确做法：                                                   │
 │  - 自行判断 → 选择最合理方案 → 执行 → 记录决策理由             │
 │  - 遇到无法自行决策的重大分歧 → 记录到日志 → 按保守方案继续    │
-│  - 用户有意见会主动来说                                       │
+│  - 用户有意见会通过 /agent-worktree 命令主动来说              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -1380,7 +1724,7 @@ logs/progress/<date>_<time>_user_decision.md
 问题出现
   ↓
 能自己解决？
-  ├─ 是：直接解决 → 记录到进度快照的"本轮解决的问题"
+  ├─ 是：直接解决 → 记录到 plan-ledger.md Decision Log
   └─ 否：
        ↓
      是否阻塞当前任务？
@@ -1388,19 +1732,8 @@ logs/progress/<date>_<time>_user_decision.md
        └─ 是：
             ↓
           选择保守/安全方案先推进
-          记录到 logs/progress/ 中标注 ⚠️ 待确认
-          用户看到后会主动沟通
-```
-
-**决策记录格式**（写在进度快照中）：
-
-```markdown
-## ⚠️ 自主决策（待用户确认）
-
-- 问题: 边缘跟随 lost_distance 阈值不确定，文档说 1.2m 但实测似乎偏大
-- 决策: 先用文档值 1.2m，后续可调
-- 理由: 保守方案，不影响安全性
-- 如需修改: 用户告知即可，改动成本低（单参数）
+          记录到 plan-ledger.md Decision Log 标注 ⚠️ 待确认
+          用户查看 progress 时会看到
 ```
 
 **硬性规定**：
@@ -1410,7 +1743,7 @@ logs/progress/<date>_<time>_user_decision.md
 2. 不等。不因为"不确定"停下来等用户回复。
 3. 不猜用户想法。按文档 + 设计原则 + 安全优先做决策。
 4. 用户有意见会主动来说。收到用户反馈后立即调整。
-5. 重大决策（影响架构/接口/安全）写入日志并标注 ⚠️，方便用户事后审阅。
+5. 重大决策（影响架构/接口/安全）写入 plan-ledger.md 并标注 ⚠️，方便用户事后审阅。
 ```
 
 ## 13. 第一阶段 Agent 分派建议
@@ -1505,7 +1838,7 @@ logs/progress/<date>_<time>_user_decision.md
 8. 不让 Kimi 等空证据包。没有证据包不得送 Kimi 验收。
 9. 每完成一阶段必须汇报 + 等用户确认。不得一口气跑完多个 Phase 无人监督。
 10. 不让 PR 秒合。确保 CI 流程 > 90 秒，给 Codex 反应时间。
-11. 每 5 分钟必须写进度快照到 logs/progress/。连续无进展必须说明原因。
+11. 每 5 分钟必须写进度快照到 logs/progress/（手动模式）或由 supervisor 自动汇报（管线模式）。
 12. 每次 Kimi 审核（含 PASS）必须写记录到 logs/kimi_reviews/，不可事后补。
 13. 不删除、不修改已有的进度快照和审核记录文件。日志只追加不改。
 14. 不打断用户。遇到问题自行决策 + 记录理由，不得阻塞等待用户回复。
@@ -1517,6 +1850,49 @@ logs/progress/<date>_<time>_user_decision.md
 - Main Agent 发现子 Agent 违纪 → 驳回 PR + 记录违规
 - 用户发现 Main Agent 违纪 → 停止当前 Phase，回退到上一个稳定状态
 - 连续 2 次违纪 → 该 Agent 任务降级为手动监督模式
+```
+
+### 15.1 自愈机制
+
+自治管线具备以下自愈能力，确保无人值守时的持续运行：
+
+```text
+┌──────────────────────────┬──────────────────────────────────────────────┐
+│ 异常场景                  │ 自愈策略                                      │
+├──────────────────────────┼──────────────────────────────────────────────┤
+│ Worker 心跳超 300s        │ supervisor SIGKILL worker 进程                │
+│                          │ 任务重排队（retry++）                          │
+│                          │ slot 释放，可接受新任务                        │
+├──────────────────────────┼──────────────────────────────────────────────┤
+│ Worker 输出 err          │ retry++ (最多 3 次)                           │
+│                          │ 超过 3 次 → 任务移入 failures/                │
+│                          │ 失败原因记录到 plan-ledger.md                 │
+├──────────────────────────┼──────────────────────────────────────────────┤
+│ Worker 死亡无输出         │ 等同 err 处理：heartbeat 超时检测 → SIGKILL   │
+│                          │ retry++ → 重排队或进 failures/                │
+├──────────────────────────┼──────────────────────────────────────────────┤
+│ PR behind main           │ supervisor stage 3b 检测到 behind 状态        │
+│                          │ 自动调用 GitHub API update-branch              │
+│                          │ 90 秒 throttle（同一 PR 不频繁触发）           │
+├──────────────────────────┼──────────────────────────────────────────────┤
+│ 队列低于 5 个任务         │ supervisor stage 4 触发 LLM 自动补充          │
+│                          │ 参考 plan-ledger.md 的 Failures Reflection   │
+│                          │ 避免生成之前失败过的同类任务                   │
+├──────────────────────────┼──────────────────────────────────────────────┤
+│ supervisor 自身脚本更新   │ 检测到 _supervisor.sh 文件变更时               │
+│                          │ exec 自我重启（inflight worker 不受影响）       │
+│                          │ 重启后从 pipeline/state/ 恢复状态              │
+└──────────────────────────┴──────────────────────────────────────────────┘
+```
+
+**重试策略详细说明**：
+
+```text
+第 1 次重试: 立即重排队，原始 prompt 不变
+第 2 次重试: 重排队，在 prompt_hint 中追加上次失败原因
+第 3 次重试: 重排队，LLM 重写 prompt_hint（基于前两次失败分析）
+第 3 次仍失败: 任务进入 failures/，supervisor 不再自动重试
+             用户可手动修改任务后通过 /agent-worktree resume 重新入队
 ```
 
 ## 16. 完成定义（Definition of Done）
@@ -1539,7 +1915,151 @@ logs/progress/<date>_<time>_user_decision.md
 - [ ] AGENTS.md 末尾追加了 Pipeline rules + Codex review guidelines
 ```
 
-## 17. 结论
+### 16.1 管线 CLI 工具
+
+自治管线提供以下 CLI 工具供用户和 supervisor 使用：
+
+```text
+pipeline/bin/pipeline-start <config>     # 启动 supervisor 守护进程
+pipeline/bin/pipeline-stop [--force]     # 优雅停止 / --force 强制 SIGKILL
+pipeline/bin/pipeline-status [--watch]   # 查看状态 / --watch 持续刷新
+pipeline/bin/pipeline-progress           # 触发即时 LLM 进度报告
+pipeline/bin/pipeline-tail               # tail -f supervisor 日志
+```
+
+**pipeline-start**：
+
+```text
+用法: pipeline-start <config.json>
+功能:
+  1. 验证 config.json 格式
+  2. 调用 LLM 分解任务 → queue.json
+  3. 创建 pipeline/state/ 目录结构
+  4. 创建 worktree slots
+  5. nohup setsid 启动 _supervisor.sh
+  6. 写入 orchestrator.pid
+  7. 输出 "Pipeline started, PID=<pid>"
+```
+
+**pipeline-stop**：
+
+```text
+用法: pipeline-stop [--force]
+功能:
+  默认: 发送 SIGTERM → supervisor 在当前 tick 结束后优雅退出
+        等待 inflight worker 自然完成（最长 heartbeat_stale_sec）
+  --force: 发送 SIGKILL 给 supervisor 和所有 worker
+           inflight 任务自动标记为 RETRY
+```
+
+**pipeline-status**：
+
+```text
+用法: pipeline-status [--watch]
+功能:
+  读取 pipeline/state/status.json 并输出人类可读摘要
+  --watch: 每 5 秒刷新（类似 watch 命令）
+输出示例:
+  Pipeline: RUNNING (PID 12345, uptime 3h20m)
+  Workers:  3/3 active
+  Queue:    12 | Inflight: 3 | In PR: 2 | Completed: 8 | Failed: 1
+  Progress: 8/100 commits (8%)
+  ETA:      ~18h
+```
+
+**pipeline-progress**：
+
+```text
+用法: pipeline-progress
+功能:
+  不等待 20 分钟周期，立即触发 LLM 生成进度报告
+  写入 plan-ledger.md + progress-latest.txt
+  同时输出到 stdout
+```
+
+**pipeline-tail**：
+
+```text
+用法: pipeline-tail
+功能:
+  tail -f pipeline/state/supervisor.log
+  实时查看 supervisor 的 tick 日志
+```
+
+## 17. 管线配置 (config.json)
+
+管线通过 `pipeline/state/config.json` 配置，启动时由用户或 `/agent-worktree` 命令生成：
+
+```json
+{
+  "goal_desc": "实现 L0/L1 仿真导航系统，包括反应式导航、2D 仿真、自动化测试",
+  "worker_count": 3,
+  "worker_roles": [
+    {"slot": "slot-navigation", "role": "navigation"},
+    {"slot": "slot-simulation", "role": "simulation"},
+    {"slot": "slot-brain", "role": "brain"}
+  ],
+  "stop_condition": "commits >= 100 AND queue_empty AND inflight_empty",
+  "target_commits": 100,
+  "max_hours": 24,
+  "worker_model": "claude-4.6-sonnet-medium-thinking",
+  "verify_cmd": "bash scripts/verify.sh",
+  "tick_period_sec": 60,
+  "heartbeat_stale_sec": 300,
+  "progress_period_sec": 1200
+}
+```
+
+**配置字段说明**：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `goal_desc` | string | 管线目标描述，写入 plan-ledger.md Goal 节 |
+| `worker_count` | number | 初始 worker 数量，可通过 `scale` 命令动态调整 |
+| `worker_roles` | array | worker slot 定义，每个 slot 绑定一个角色 |
+| `stop_condition` | string | 停止条件表达式，支持 AND/OR 组合 |
+| `target_commits` | number | 目标 commit 数，用于分解任务和判断停止条件 |
+| `max_hours` | number | 最大运行时间（小时），超时自动优雅停止 |
+| `worker_model` | string | worker 使用的 LLM 模型 |
+| `verify_cmd` | string | 验证命令，worker Step 6 执行 |
+| `tick_period_sec` | number | supervisor tick 循环周期（秒） |
+| `heartbeat_stale_sec` | number | 心跳超时判定阈值（秒） |
+| `progress_period_sec` | number | 自动进度报告周期（秒），默认 1200 = 20 分钟 |
+
+**停止条件语法**：
+
+```text
+支持的变量:
+  commits     — 已合并的 commit 数
+  queue_empty — 队列是否为空 (bool)
+  inflight_empty — 是否无 inflight 任务 (bool)
+  hours       — 已运行小时数
+  failures    — 失败任务数
+
+支持的运算符: >=, <=, ==, AND, OR
+
+示例:
+  "commits >= 100 AND queue_empty AND inflight_empty"
+  "hours >= 24"
+  "commits >= 50 OR hours >= 12"
+```
+
+**动态扩缩容**：
+
+```text
+/agent-worktree scale 5
+  → supervisor 动态添加 2 个 slot（slot-extra-1, slot-extra-2）
+  → 新 slot 角色为 null（接受任意任务）
+  → 创建对应 worktree
+  → 下一个 tick 开始调度新任务到新 slot
+
+/agent-worktree scale 1
+  → supervisor 标记多余 slot 为 draining
+  → 等待 draining slot 的 inflight 任务完成
+  → 完成后删除 worktree 释放磁盘
+```
+
+## 18. 结论
 
 该多 Agent 协作方式的核心是：
 
@@ -1552,6 +2072,7 @@ Codex 管单 PR 级代码安全（自动、快速）；
 Test Runner 管证据，不口头通过；
 Kimi 管 Phase 级系统验收（全面、深入）；
 不通过就返工，直到证据包和验收意见都通过。
+supervisor 守护进程 + worktree worker = 全自动后台执行。
 ```
 
 双层 Review 保障：
@@ -1561,4 +2082,12 @@ L1 (Codex): 每个 PR → 自动触发 → P0/P1 拦截 → 30-90s 内反应
 L2 (Kimi):  每个 Phase → 手动送审 → 功能完整性 + 回归验证 → 结构化意见
 ```
 
-这样可以把长程机器人导航开发拆成可控的小闭环，每次代码变更都有 CI 保护和自动 review，每个阶段都有可复现的验收依据，减少上下文污染的同时保证代码质量持续可控。
+自治管线保障：
+
+```text
+L0 (supervisor): 后台守护 → 60s tick → 自动调度 → 自动重试 → 自动补充
+L1 (worker):     worktree 隔离 → 独立分支 → verify.sh → PR → auto-merge
+L2 (自愈):       心跳检测 → 挂起清理 → 队列补充 → PR behind 修复 → 脚本热更新
+```
+
+这样可以把长程机器人导航开发拆成可控的小闭环，每次代码变更都有 CI 保护和自动 review，每个阶段都有可复现的验收依据，减少上下文污染的同时保证代码质量持续可控。用户启动管线后可以离开，supervisor 在后台持续推进，直到目标达成或需要人工干预。
