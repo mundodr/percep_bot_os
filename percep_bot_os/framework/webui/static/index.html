@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>percep_bot_os</title>
+<style>
+  :root {
+    --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3a;
+    --text: #e4e6ef; --muted: #8b8fa3; --accent: #6c7ee1;
+    --green: #34d399; --red: #f87171; --gray: #6b7280; --yellow: #fbbf24;
+    --radius: 10px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh;
+  }
+  .container { max-width: 1100px; margin: 0 auto; padding: 20px; }
+
+  /* 顶栏 */
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 20px; background: var(--surface); border-radius: var(--radius);
+    margin-bottom: 16px; border: 1px solid var(--border);
+  }
+  header .title { font-size: 18px; font-weight: 700; letter-spacing: -0.3px; }
+  header .status-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: 500;
+    margin-left: 12px;
+  }
+  .badge-running { background: rgba(52,211,153,0.15); color: var(--green); }
+  .badge-stopped { background: rgba(107,114,128,0.15); color: var(--gray); }
+  .badge-failed  { background: rgba(248,113,113,0.15); color: var(--red); }
+  header .uptime { color: var(--muted); font-size: 13px; margin-left: 16px; }
+  .btn-group { display: flex; gap: 8px; }
+  .btn {
+    padding: 7px 16px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--surface); color: var(--text); font-size: 13px; cursor: pointer;
+    transition: all 0.15s;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-danger:hover { border-color: var(--red); color: var(--red); }
+
+  /* 模块表格 */
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); margin-bottom: 16px; overflow: hidden;
+  }
+  .card-title {
+    padding: 12px 20px; font-size: 14px; font-weight: 600;
+    border-bottom: 1px solid var(--border); color: var(--muted);
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left; padding: 10px 16px; font-size: 12px; font-weight: 500;
+    color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border);
+  }
+  td { padding: 12px 16px; font-size: 14px; border-bottom: 1px solid var(--border); }
+  tr:last-child td { border-bottom: none; }
+  .dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px;
+  }
+  .dot-running { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot-stopped { background: var(--gray); }
+  .dot-failed  { background: var(--red); box-shadow: 0 0 6px var(--red); }
+  .btn-sm {
+    padding: 4px 10px; font-size: 12px; border: 1px solid var(--border);
+    border-radius: 4px; background: transparent; color: var(--text); cursor: pointer;
+  }
+  .btn-sm:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* 日志面板 */
+  .log-header {
+    display: flex; align-items: center; gap: 12px; padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+  .log-header select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; padding: 4px 8px; font-size: 13px;
+  }
+  #log-box {
+    height: 240px; overflow-y: auto; padding: 12px 20px;
+    font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px;
+    line-height: 1.7; color: var(--muted); white-space: pre-wrap;
+  }
+
+  /* Topics */
+  .topic-list { padding: 12px 20px; }
+  .topic-item {
+    display: flex; justify-content: space-between; padding: 6px 0;
+    font-size: 13px; border-bottom: 1px solid var(--border);
+  }
+  .topic-item:last-child { border-bottom: none; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div style="display:flex;align-items:center;">
+      <span class="title">percep_bot_os</span>
+      <span id="sys-badge" class="status-badge badge-stopped">● STOPPED</span>
+      <span id="sys-uptime" class="uptime">Uptime 00:00:00</span>
+    </div>
+    <div class="btn-group">
+      <button class="btn" onclick="post('/api/system/start_all')">Start All</button>
+      <button class="btn" onclick="post('/api/system/stop_all')">Stop All</button>
+      <button class="btn" onclick="post('/api/system/restart_all')">Restart All</button>
+      <button class="btn btn-danger" onclick="post('/api/system/shutdown')">Shutdown</button>
+    </div>
+  </header>
+
+  <div class="card">
+    <div class="card-title">Modules</div>
+    <table>
+      <thead>
+        <tr><th>Module</th><th>State</th><th>Health</th><th>Message</th><th>Actions</th></tr>
+      </thead>
+      <tbody id="mod-table"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Topics</div>
+    <div id="topic-list" class="topic-list" style="color:var(--muted);font-size:13px;">
+      No topics yet
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="log-header">
+      <span style="font-size:14px;font-weight:600;color:var(--muted);">Logs</span>
+      <select id="log-select"></select>
+    </div>
+    <div id="log-box">Waiting for modules…</div>
+  </div>
+</div>
+
+<script>
+const API = '';
+async function get(url) {
+  try { const r = await fetch(API+url); return await r.json(); }
+  catch { return {ok:false}; }
+}
+async function post(url) {
+  try { await fetch(API+url, {method:'POST'}); } catch {}
+}
+
+function fmtTime(s) {
+  const h = Math.floor(s/3600), m = Math.floor(s%3600/60), sec = Math.floor(s%60);
+  return [h,m,sec].map(v=>String(v).padStart(2,'0')).join(':');
+}
+
+function stateClass(s) {
+  if (s==='RUNNING') return 'running';
+  if (s==='FAILED') return 'failed';
+  return 'stopped';
+}
+
+async function refresh() {
+  const status = await get('/api/status');
+  if (status.ok) {
+    const d = status.data;
+    const badge = document.getElementById('sys-badge');
+    const cls = d.failed>0 ? 'failed' : d.running>0 ? 'running' : 'stopped';
+    const label = d.failed>0 ? 'DEGRADED' : d.running>0 ? 'RUNNING' : 'STOPPED';
+    badge.className = 'status-badge badge-' + cls;
+    badge.textContent = '● ' + label;
+    document.getElementById('sys-uptime').textContent = 'Uptime ' + fmtTime(d.uptime);
+  }
+
+  const mods = await get('/api/modules');
+  if (mods.ok) {
+    const tb = document.getElementById('mod-table');
+    tb.innerHTML = mods.data.map(m => {
+      const sc = stateClass(m.state);
+      return `<tr>
+        <td><strong>${m.name}</strong></td>
+        <td><span class="dot dot-${sc}"></span>${m.state}</td>
+        <td>${m.health_ok ? 'OK' : 'ERR'}</td>
+        <td style="color:var(--muted)">${m.health_message || m.error || '-'}</td>
+        <td>
+          <button class="btn-sm" onclick="post('/api/modules/${m.name}/start')">▶</button>
+          <button class="btn-sm" onclick="post('/api/modules/${m.name}/stop')">⏹</button>
+          <button class="btn-sm" onclick="post('/api/modules/${m.name}/restart')">↻</button>
+        </td>
+      </tr>`;
+    }).join('');
+
+    const sel = document.getElementById('log-select');
+    const cur = sel.value;
+    const names = mods.data.map(m=>m.name);
+    if (sel.options.length !== names.length) {
+      sel.innerHTML = names.map(n=>`<option value="${n}">${n}</option>`).join('');
+      if (cur && names.includes(cur)) sel.value = cur;
+    }
+  }
+
+  const topics = await get('/api/topics');
+  if (topics.ok && topics.data.length > 0) {
+    document.getElementById('topic-list').innerHTML = topics.data.map(t =>
+      `<div class="topic-item"><span>${t.name}</span><span>${t.rate} Hz</span></div>`
+    ).join('');
+  }
+}
+
+setInterval(refresh, 1000);
+refresh();
+</script>
+</body>
+</html>

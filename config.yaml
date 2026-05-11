@@ -1,0 +1,15 @@
+manager:
+  log_dir: ./logs
+  shutdown_timeout: 5.0
+
+webui:
+  enabled: true
+  bind: 127.0.0.1
+  port: 8080
+  refresh_interval: 1.0
+
+modules:
+  hello:
+    enabled: true
+    class: percep_bot_os.modules.hello.HelloModule
+    config: {}
