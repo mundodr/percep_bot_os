@@ -26,6 +26,7 @@ include = [
     "exploration*",
     "map_store*",
     "integration*",
+    "sim*",
 ]
 
 [tool.ruff]
