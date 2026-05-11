@@ -37,6 +37,7 @@ _DEFAULTS: dict[str, float] = {
     "goal_timeout": 3.0,
     "edge_follow_distance": 0.35,
     "edge_follow_timeout": 15.0,
+    "emergency_recovery_timeout": 1.0,
 }
 
 
@@ -80,6 +81,12 @@ class ReactiveNavigator:
             if front_dist >= self.safety_distance:
                 self.nav_state.state = "RECOVERY"
             else:
+                stuck_duration = now - self.nav_state.last_emergency_stop_time
+                if stuck_duration >= self.emergency_recovery_timeout:
+                    # 超时后缓慢原地旋转脱困，朝通行空间更大的方向
+                    cmd = self._clamp(self._emergency_recovery_rotate(scan))
+                    self.nav_state.last_command = cmd
+                    return cmd
                 cmd = self._emergency_stop()
                 self.nav_state.last_command = cmd
                 return cmd
@@ -167,32 +174,58 @@ class ReactiveNavigator:
     def _edge_follow(
         self, goal: Goal | None, scan: ObstacleScan, now: float
     ) -> VelocityCommand:
-        """边缘跟随：沿障碍物边缘绕行。"""
+        """边缘跟随：沿障碍物边缘绕行，维持与障碍的安全距离。"""
         ef = self.nav_state.edge_follow
 
+        base_angular = 0.4
         if ef.bypass_side == "left":
-            angular_z = 0.4
+            angular_z = base_angular
         else:
-            angular_z = -0.4
+            angular_z = -base_angular
 
         side_dist = (
             clearance_left(scan) if ef.bypass_side == "left" else clearance_right(scan)
         )
+        front_dist = min_distance_ahead(scan)
 
         linear_x = self.max_linear_speed * 0.4
-        linear_x = self._apply_slowdown(linear_x, scan)
 
-        if side_dist < self.edge_follow_distance * 0.5:
+        # 侧向距离低于安全距离时，大幅增大转向、减小前进速度
+        if side_dist < self.safety_distance:
+            angular_z *= 2.5
+            linear_x *= 0.2
+        elif side_dist < self.edge_follow_distance * 0.5:
             angular_z *= 1.5
             linear_x *= 0.5
 
-        ef.last_seen_obstacle_distance = min_distance_ahead(scan)
+        # 前方距离接近安全距离时，进一步减速并增加转向
+        if front_dist < self.safety_distance * 1.5:
+            steer_boost = 1.0 + (self.safety_distance * 1.5 - front_dist) / (
+                self.safety_distance * 1.5
+            )
+            angular_z *= steer_boost
+            linear_x *= max(
+                0.1,
+                (front_dist - self.emergency_stop_distance)
+                / (self.safety_distance * 1.5 - self.emergency_stop_distance),
+            )
+
+        linear_x = self._apply_slowdown(linear_x, scan)
+
+        ef.last_seen_obstacle_distance = front_dist
 
         return VelocityCommand(linear_x, angular_z)
 
     def _emergency_stop(self) -> VelocityCommand:
         """急停：返回零速度命令。"""
         return VelocityCommand(0.0, 0.0)
+
+    def _emergency_recovery_rotate(self, scan: ObstacleScan) -> VelocityCommand:
+        """急停超时后的缓慢原地旋转脱困，朝通行空间更大的方向。"""
+        left = clearance_left(scan)
+        right = clearance_right(scan)
+        direction = 1.0 if left >= right else -1.0
+        return VelocityCommand(0.0, self.max_angular_speed * 0.3 * direction)
 
     def _recovery(self, scan: ObstacleScan) -> VelocityCommand:
         """恢复模式：原地旋转寻找出路。"""

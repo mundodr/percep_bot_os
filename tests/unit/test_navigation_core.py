@@ -211,3 +211,76 @@ class TestReactiveNavigator:
         cmd = nav.compute_command(None, scan_safe, 2.0)
         assert nav.state == "RECOVERY"
         assert cmd.angular_z != 0.0
+
+    def test_edge_follow_maintains_distance(self) -> None:
+        """边缘跟随中侧向距离低于 safety_distance 时增大转向、减小前进。"""
+        nav = ReactiveNavigator()
+        scan_init = _make_scan(front=0.25, left=2.0, right=0.5)
+        goal = _make_goal(x=2.0, y=0.0)
+        now = 100.0
+        nav.compute_command(goal, scan_init, now)
+        assert nav.state == "EDGE_FOLLOW"
+        # bypass_side="left"，侧向距离检查的是 clearance_left
+
+        # 侧向障碍很近（left=0.15 < safety_distance 0.30），front 保持阻塞
+        scan_close_side = _make_scan(front=0.25, left=0.15, right=0.5)
+        cmd_close = nav.compute_command(goal, scan_close_side, now + 0.1)
+
+        # 侧向障碍较远
+        nav2 = ReactiveNavigator()
+        scan_init2 = _make_scan(front=0.25, left=2.0, right=0.5)
+        nav2.compute_command(goal, scan_init2, now)
+        scan_far_side = _make_scan(front=0.25, left=1.0, right=0.5)
+        cmd_far = nav2.compute_command(goal, scan_far_side, now + 0.1)
+
+        # 侧向障碍近时，转向更大、前进更小
+        assert abs(cmd_close.angular_z) > abs(cmd_far.angular_z)
+        assert cmd_close.linear_x < cmd_far.linear_x
+
+    def test_emergency_stop_recovery_rotation(self) -> None:
+        """急停超时后通过缓慢旋转脱困。"""
+        nav = ReactiveNavigator({"emergency_recovery_timeout": 1.0})
+        # 前方极近障碍 → 急停
+        scan_stuck = _make_scan(front=0.05)
+        nav.compute_command(None, scan_stuck, 10.0)
+        assert nav.state == "EMERGENCY_STOP"
+
+        # 0.5s 后仍急停，前方 0.15 (> emergency_stop_distance 但 < safety_distance)
+        scan_mid = _make_scan(front=0.15, left=2.0, right=0.5)
+        cmd_wait = nav.compute_command(None, scan_mid, 10.5)
+        assert cmd_wait.linear_x == 0.0
+        assert cmd_wait.angular_z == 0.0
+        assert nav.state == "EMERGENCY_STOP"
+
+        # 1.5s 后超时，应开始旋转脱困
+        cmd_rotate = nav.compute_command(None, scan_mid, 11.5)
+        assert nav.state == "EMERGENCY_STOP"
+        assert cmd_rotate.linear_x == 0.0
+        assert cmd_rotate.angular_z != 0.0
+        # 左侧空间更大 → 正角速度
+        assert cmd_rotate.angular_z > 0.0
+        assert abs(cmd_rotate.angular_z) <= nav.max_angular_speed * 0.3 + 1e-9
+
+    def test_edge_follow_no_deadlock(self) -> None:
+        """长时间 edge_follow 不会死锁到 EMERGENCY_STOP。"""
+        nav = ReactiveNavigator()
+        goal = _make_goal(x=3.0, y=0.0)
+        now = 0.0
+
+        # 初始触发 edge_follow
+        scan_blocked = _make_scan(front=0.25, left=2.0, right=0.8)
+        nav.compute_command(goal, scan_blocked, now)
+        assert nav.state == "EDGE_FOLLOW"
+
+        # 模拟 100 步 edge_follow（前方距离在安全线附近波动）
+        emergency_count = 0
+        for step in range(100):
+            now += 0.1
+            front = 0.20 + 0.05 * (step % 3)  # 0.20 ~ 0.30 波动
+            scan = _make_scan(front=front, left=1.5, right=0.4)
+            nav.compute_command(goal, scan, now)
+            if nav.state == "EMERGENCY_STOP":
+                emergency_count += 1
+
+        # 不应频繁进入急停（允许少量边缘触发）
+        assert emergency_count < 10
